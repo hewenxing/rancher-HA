@@ -1,0 +1,480 @@
+节点名称	IP	安装组件
+nginx	172.16.35.119	nginx
+node1	172.16.35.36	etcd, docker, k8s
+node2	172.16.35.37	etcd, docker, k8s
+node3	172.16.35.81	etcd, docker, k8s
+
+
+
+systemctl stop firewalld
+systemctl disable firewalld
+setenforce 0
+sed -i s#SELINUX=enforcing#SELINUX=disabled# /etc/selinux/config
+yum -y install epel-release
+yum -y install python-pip
+pip install --upgrade pip
+yum -y install wget vim lsof
+yum install net-tools -y
+yum install traceroute -y
+yum install lrzsz -y
+yum -y update
+关闭swap
+swapoff -a && sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+
+设置永久主机名称，然后重新登录
+sudo hostnamectl set-hostname node1
+sudo hostnamectl set-hostname node2
+sudo hostnamectl set-hostname node3
+
+cat >> /etc/hosts << EOF
+172.16.35.36 node1
+172.16.35.37 node2
+172.16.35.81 node3
+172.16.35.119 rancher.sumapay.com
+EOF
+
+文件打开数调优
+echo -e "root soft nofile 65535\nroot hard nofile 65535\n* soft nofile 65535\n* hard nofile 65535\n" >> /etc/security/limits.conf
+sed -i 's#4096#65535#g' /etc/security/limits.d/20-nproc.conf
+
+kernel调优
+cat >> /etc/sysctl.conf<<EOF
+net.ipv4.ip_forward=1
+net.bridge.bridge-nf-call-iptables=1
+net.bridge.bridge-nf-call-ip6tables=1
+vm.swappiness=0
+vm.max_map_count=655360
+EOF
+
+yum -y install wget ntpdate lrzsz curl yum-utils device-mapper-persistent-data lvm2 bash-completion && ntpdate -u cn.pool.ntp.org
+
+创建用户并且添加到docker组
+groupadd docker
+useradd rancher -G docker
+echo "123456" | passwd --stdin rancher
+
+su - rancher
+ssh-keygen
+ssh-copy-id rancher@172.16.35.36
+ssh-copy-id rancher@172.16.35.37
+ssh-copy-id rancher@172.16.35.81
+
+安装docker
+yum-config-manager --add-repo http://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+
+yum remove -y docker \
+docker-client \
+docker-client-latest \
+docker-common \
+docker-latest \
+docker-latest-logrotate \
+docker-logrotate \
+docker-selinux \
+docker-engine-selinux \
+docker-engine \
+container*
+
+yum -y install --setopt=obsoletes=0 docker-ce-17.03.2.ce-1.el7.centos docker-ce-selinux-17.03.2.ce-1.el7.centos
+
+systemctl enable docker
+systemctl start docker
+systemctl status docker
+
+添加国内加速代理，设置storage-driver
+cat > /etc/docker/daemon.json << EOF
+{
+"registry-mirrors": ["https://39r65dar.mirror.aliyuncs.com"],
+"storage-driver": "overlay2",
+"storage-opts": [
+"overlay2.override_kernel_check=true"
+]
+}
+{
+"log-driver": "json-file",
+"log-opts": {
+    "max-size": "100m",
+    "max-file": "3"
+    }
+}
+EOF
+
+systemctl daemon-reload
+systemctl restart docker
+
+安装nginx
+sudo rpm -Uvh http://nginx.org/packages/centos/7/noarch/RPMS/nginx-release-centos-7-0.el7.ngx.noarch.rpm
+yum install nginx -y
+sudo systemctl enable nginx.service
+
+vi /etc/nginx/nginx.conf
+user  nginx;
+worker_processes  1;
+worker_rlimit_nofile 40000;
+
+error_log  /var/log/nginx/error.log warn;
+pid        /var/run/nginx.pid;
+
+
+events {
+    worker_connections  8192;
+}
+
+
+http {
+    # Gzip Settings
+    gzip on;
+    gzip_disable "msie6";
+    gzip_disable "MSIE [1-6]\.(?!.*SV1)";
+    gzip_vary on;
+    gzip_static on;
+    gzip_proxied any;
+    gzip_min_length 0;
+    gzip_comp_level 8;
+    gzip_buffers 16 8k;
+    gzip_http_version 1.1;
+    gzip_types text/xml application/xml application/atom+xml application/rss+xml application/xhtml+xml image/svg+xml application/font-woff text/javascript application/javascript application/x-javascript text/x-json applicati
+on/json application/x-web-app-manifest+json text/css text/plain text/x-component font/opentype application/x-font-ttf application/vnd.ms-fontobjectfont/woff2 image/x-icon image/png image/jpeg;    server {
+        listen         80;
+        return 301 https://$host$request_uri;
+    }
+}
+stream {
+    upstream rancher_servers {
+        least_conn;
+        server 172.16.35.36:443 max_fails=3 fail_timeout=5s;
+        server 172.16.35.37:443 max_fails=3 fail_timeout=5s;
+        server 172.16.35.81:443 max_fails=3 fail_timeout=5s;
+    }
+    server {
+        listen     443;
+        proxy_pass rancher_servers;
+    }
+}
+
+sudo systemctl restart nginx.service
+
+
+rancher集群部署
+安装rke  到https://github.com/rancher/rke/releases?after=v0.2.3-rc4下载v0.2.2
+su root
+chmod +x rke_linux-amd64
+mv rke_linux-amd64 /usr/bin/rke
+
+
+
+安装kubectl
+cat <<EOF > /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://mirrors.aliyun.com/kubernetes/yum/repos/kubernetes-el7-x86_64
+enabled=1
+gpgcheck=0
+EOF
+yum clean all
+yum makecache fast
+
+yum -y install kubelet kubeadm kubectl kubernetes-cni
+ systemctl enable kubelet && systemctl start kubelet
+
+安装helm 到https://github.com/helm/helm/tags下载v2.13.1
+
+tar xf helm-linux.tar.gz
+mv linux-amd64/helm /usr/bin/helm
+mv linux-amd64/tiller /usr/bin/tiller
+rm -rf helm-linux.tar.gz linux-amd64/
+
+安装k8s
+su - rancher
+cat > rancher-cluster.yml << EOF
+nodes:
+  - address: 172.16.35.36
+    user: rancher
+    role: [controlplane,worker,etcd]
+  - address: 172.16.35.37
+    user: rancher
+    role: [controlplane,worker,etcd]
+  - address: 172.16.35.81
+    user: rancher
+    role: [controlplane,worker,etcd]
+services:
+  etcd:
+    snapshot: true
+    creation: 6h
+    retention: 24h
+EOF
+
+启动集群
+rke up --config ./rancher-cluster.yml
+
+配置环境变量
+su - root
+vi /etc/profile
+export KUBECONFIG=/home/rancher/kube_config_rancher-cluster.yml
+source /etc/profile
+
+配置一下kubectl的命令补全功能
+echo "source <(kubectl completion bash)" >> ~/.bashrc
+source ~/.bashrc
+su - rancher
+echo "source <(kubectl completion bash)" >> ~/.bashrc
+source ~/.bashrc
+
+
+查看节点状态
+su - rancher
+kubectl get node
+kubectl get pods --all-namespaces
+
+在kube-system命名空间中创建ServiceAccount
+kubectl -n kube-system create serviceaccount tiller
+
+创建ClusterRoleBinding以授予tiller帐户对集群的访问权限
+kubectl create clusterrolebinding tiller --clusterrole cluster-admin --serviceaccount=kube-system:tiller
+
+需要修改成国内镜像
+kubectl --namespace=kube-system set image deployments/tiller-deploy tiller=registry.cn-hangzhou.aliyuncs.com/eryajf/tiller:v2.13.1
+
+安装Helm Server
+helm init --service-account tiller   --tiller-image registry.cn-hangzhou.aliyuncs.com/eryajf/tiller:v2.13.1 --stable-repo-url https://kubernetes.oss-cn-hangzhou.aliyuncs.com/charts
+
+
+helm安装rancher
+添加Chart仓库地址
+helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
+
+生成自签名证书
+vim create_self-signed-cert.sh
+#!/bin/bash -e
+
+help ()
+{
+    echo  ' ================================================================ '
+    echo  ' --ssl-domain: 生成ssl证书需要的主域名，如不指定则默认为localhost，如果是ip访问服务，则可忽略；'
+    echo  ' --ssl-trusted-ip: 一般ssl证书只信任域名的访问请求，有时候需要使用ip去访问server，那么需要给ssl证书添加扩展IP，多个IP用逗号隔开；'
+    echo  ' --ssl-trusted-domain: 如果想多个域名访问，则添加扩展域名（SSL_TRUSTED_DOMAIN）,多个扩展域名用逗号隔开；'
+    echo  ' --ssl-size: ssl加密位数，默认2048；'
+    echo  ' --ssl-date: ssl有效期，默认10年；'
+    echo  ' --ca-date: ca有效期，默认10年；'
+    echo  ' --ssl-cn: 国家代码(2个字母的代号),默认CN;'
+    echo  ' 使用示例:'
+    echo  ' ./create_self-signed-cert.sh --ssl-domain=www.test.com --ssl-trusted-domain=www.test2.com \ '
+    echo  ' --ssl-trusted-ip=1.1.1.1,2.2.2.2,3.3.3.3 --ssl-size=2048 --ssl-date=3650'
+    echo  ' ================================================================'
+}
+
+case "$1" in
+    -h|--help) help; exit;;
+esac
+
+if [[ $1 == '' ]];then
+    help;
+    exit;
+fi
+
+CMDOPTS="$*"
+for OPTS in $CMDOPTS;
+do
+    key=$(echo ${OPTS} | awk -F"=" '{print $1}' )
+    value=$(echo ${OPTS} | awk -F"=" '{print $2}' )
+    case "$key" in
+        --ssl-domain) SSL_DOMAIN=$value ;;
+        --ssl-trusted-ip) SSL_TRUSTED_IP=$value ;;
+        --ssl-trusted-domain) SSL_TRUSTED_DOMAIN=$value ;;
+        --ssl-size) SSL_SIZE=$value ;;
+        --ssl-date) SSL_DATE=$value ;;
+        --ca-date) CA_DATE=$value ;;
+        --ssl-cn) CN=$value ;;
+    esac
+done
+
+# CA相关配置
+CA_DATE=${CA_DATE:-3650}
+CA_KEY=${CA_KEY:-cakey.pem}
+CA_CERT=${CA_CERT:-cacerts.pem}
+CA_DOMAIN=localhost
+
+# ssl相关配置
+SSL_CONFIG=${SSL_CONFIG:-$PWD/openssl.cnf}
+SSL_DOMAIN=${SSL_DOMAIN:-localhost}
+SSL_DATE=${SSL_DATE:-3650}
+SSL_SIZE=${SSL_SIZE:-2048}
+
+## 国家代码(2个字母的代号),默认CN;
+CN=${CN:-CN}
+
+SSL_KEY=$SSL_DOMAIN.key
+SSL_CSR=$SSL_DOMAIN.csr
+SSL_CERT=$SSL_DOMAIN.crt
+
+echo -e "\033[32m ---------------------------- \033[0m"
+echo -e "\033[32m       | 生成 SSL Cert |       \033[0m"
+echo -e "\033[32m ---------------------------- \033[0m"
+
+if [[ -e ./${CA_KEY} ]]; then
+    echo -e "\033[32m ====> 1. 发现已存在CA私钥，备份"${CA_KEY}"为"${CA_KEY}"-bak，然后重新创建 \033[0m"
+    mv ${CA_KEY} "${CA_KEY}"-bak
+    openssl genrsa -out ${CA_KEY} ${SSL_SIZE}
+else
+    echo -e "\033[32m ====> 1. 生成新的CA私钥 ${CA_KEY} \033[0m"
+    openssl genrsa -out ${CA_KEY} ${SSL_SIZE}
+fi
+
+if [[ -e ./${CA_CERT} ]]; then
+    echo -e "\033[32m ====> 2. 发现已存在CA证书，先备份"${CA_CERT}"为"${CA_CERT}"-bak，然后重新创建 \033[0m"
+    mv ${CA_CERT} "${CA_CERT}"-bak
+    openssl req -x509 -sha256 -new -nodes -key ${CA_KEY} -days ${CA_DATE} -out ${CA_CERT} -subj "/C=${CN}/CN=${CA_DOMAIN}"
+else
+    echo -e "\033[32m ====> 2. 生成新的CA证书 ${CA_CERT} \033[0m"
+    openssl req -x509 -sha256 -new -nodes -key ${CA_KEY} -days ${CA_DATE} -out ${CA_CERT} -subj "/C=${CN}/CN=${CA_DOMAIN}"
+fi
+
+echo -e "\033[32m ====> 3. 生成Openssl配置文件 ${SSL_CONFIG} \033[0m"
+cat > ${SSL_CONFIG} <<EOM
+[req]
+req_extensions = v3_req
+distinguished_name = req_distinguished_name
+[req_distinguished_name]
+[ v3_req ]
+basicConstraints = CA:FALSE
+keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+extendedKeyUsage = clientAuth, serverAuth
+EOM
+
+if [[ -n ${SSL_TRUSTED_IP} || -n ${SSL_TRUSTED_DOMAIN} ]]; then
+    cat >> ${SSL_CONFIG} <<EOM
+subjectAltName = @alt_names
+[alt_names]
+EOM
+    IFS=","
+    dns=(${SSL_TRUSTED_DOMAIN})
+    dns+=(${SSL_DOMAIN})
+    for i in "${!dns[@]}"; do
+      echo DNS.$((i+1)) = ${dns[$i]} >> ${SSL_CONFIG}
+    done
+
+    if [[ -n ${SSL_TRUSTED_IP} ]]; then
+        ip=(${SSL_TRUSTED_IP})
+        for i in "${!ip[@]}"; do
+          echo IP.$((i+1)) = ${ip[$i]} >> ${SSL_CONFIG}
+        done
+    fi
+fi
+
+echo -e "\033[32m ====> 4. 生成服务SSL KEY ${SSL_KEY} \033[0m"
+openssl genrsa -out ${SSL_KEY} ${SSL_SIZE}
+
+echo -e "\033[32m ====> 5. 生成服务SSL CSR ${SSL_CSR} \033[0m"
+openssl req -sha256 -new -key ${SSL_KEY} -out ${SSL_CSR} -subj "/C=${CN}/CN=${SSL_DOMAIN}" -config ${SSL_CONFIG}
+
+echo -e "\033[32m ====> 6. 生成服务SSL CERT ${SSL_CERT} \033[0m"
+openssl x509 -sha256 -req -in ${SSL_CSR} -CA ${CA_CERT} \
+    -CAkey ${CA_KEY} -CAcreateserial -out ${SSL_CERT} \
+    -days ${SSL_DATE} -extensions v3_req \
+    -extfile ${SSL_CONFIG}
+
+echo -e "\033[32m ====> 7. 证书制作完成 \033[0m"
+echo
+echo -e "\033[32m ====> 8. 以YAML格式输出结果 \033[0m"
+echo "----------------------------------------------------------"
+echo "ca_key: |"
+cat $CA_KEY | sed 's/^/  /'
+echo
+echo "ca_cert: |"
+cat $CA_CERT | sed 's/^/  /'
+echo
+echo "ssl_key: |"
+cat $SSL_KEY | sed 's/^/  /'
+echo
+echo "ssl_csr: |"
+cat $SSL_CSR | sed 's/^/  /'
+echo
+echo "ssl_cert: |"
+cat $SSL_CERT | sed 's/^/  /'
+echo
+
+echo -e "\033[32m ====> 9. 附加CA证书到Cert文件 \033[0m"
+cat ${CA_CERT} >> ${SSL_CERT}
+echo "ssl_cert: |"
+cat $SSL_CERT | sed 's/^/  /'
+echo
+
+echo -e "\033[32m ====> 10. 重命名服务证书 \033[0m"
+echo "cp ${SSL_DOMAIN}.key tls.key"
+cp ${SSL_DOMAIN}.key tls.key
+echo "cp ${SSL_DOMAIN}.crt tls.crt"
+cp ${SSL_DOMAIN}.crt tls.crt
+
+#执行脚本生成证书
+sh create_self-signed-cert.sh --ssl-domain=rancher.sumapay.com --ssl-trusted-ip=172.16.35.36,172.16.35.37,172.16.35.81 --ssl-size=2048 --ssl-date=3650
+
+创建命名空间
+kubectl create namespace cattle-system
+
+服务证书和私钥密文
+kubectl -n cattle-system create secret tls tls-rancher-ingress --cert=./tls.crt --key=./tls.key 
+
+ca证书密文
+kubectl -n cattle-system create secret generic tls-ca --from-file=cacerts.pem 
+
+使用helm安装rancher HA
+helm install rancher-stable/rancher --name rancher2 --namespace cattle-system --set hostname=rancher.sumapay.com --set ingress.tls.source=secret --set privateCA=true
+
+查看创建   kubectl get pods --all-namespaces
+kubectl get ns
+kubectl get ingress -n cattle-system
+kubectl get service -n cattle-system
+kubectl get serviceaccount -n cattle-system
+kubectl get ClusterRoleBinding -n cattle-system -l app=rancher2 -o wide
+kubectl get pods -n cattle-system
+kubectl get deployment -n cattle-system
+
+为Agent Pod添加主机别名(/etc/hosts)
+#cattle-cluster-agent pod
+kubectl -n cattle-system patch  daemonsets cattle-cluster-agent --patch '{
+    "spec": {
+        "template": {
+            "spec": {
+                "hostAliases": [
+                    {
+                        "hostnames":
+                        [
+                            "rancher.sumapay.com"
+                        ],
+                            "ip": "172.16.35.119"
+                    }
+                ]
+            }
+        }
+    }
+}'
+
+
+#cattle-node-agent pod
+kubectl -n cattle-system patch  daemonsets cattle-node-agent --patch '{
+    "spec": {
+        "template": {
+            "spec": {
+                "hostAliases": [
+                    {
+                        "hostnames":
+                        [
+                            "rancher.sumapay.com"
+                        ],
+                            "ip": "172.16.35.119"
+                    }
+                ]
+            }
+        }
+    }
+}'
+
+
+访问https://rancher.sumapay.com
+
+
+
+
+
+
+
